@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Fetch Megvii's YOLOX ONNX exports and prove they are the ones expected.
+
+Weights are not part of the repository; a checksum list is.  This downloads
+a named model into the runtime directory, verifies it against SHA256SUMS,
+refuses a mismatch, and writes the Apache-2.0 licence and a NOTICE beside
+what it fetched, so the directory carries its own provenance.
+
+  kilix-yolox-fetch                       all three sizes
+  kilix-yolox-fetch yolox_nano            one of them
+  kilix-yolox-fetch yolox_s --from FILE   a copy already to hand, verified
+  --dir DIR    where they go (~/.local/gpu_terminal/runtimes/yolox/models)
+  --sums FILE  the checksum list; found beside this tool otherwise
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import sys
+import urllib.request
+
+RELEASE = "0.1.1rc0"
+URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/%s/%s.onnx"
+LICENSE_URL = "https://raw.githubusercontent.com/Megvii-BaseDetection/YOLOX/%s/LICENSE"
+NAMES = ("yolox_s", "yolox_tiny", "yolox_nano")
+
+
+def default_dir():
+    return os.path.join(os.path.expanduser("~"), ".local", "gpu_terminal",
+                        "runtimes", "yolox", "models")
+
+
+def find_sums(explicit):
+    if explicit:
+        return explicit
+    env = os.environ.get("KILIX_YOLOX_SUMS")
+    if env:
+        return env
+    # realpath, not abspath: a wrapper that symlinks this tool into a
+    # runtime's bin/ must still find the list beside the real file.
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (
+            os.path.join(here, "..", "models", "SHA256SUMS"),
+            os.path.join(here, "..", "share", "kilix-yolox", "SHA256SUMS")):
+        if os.path.exists(candidate):
+            return candidate
+    raise SystemExit("kilix-yolox-fetch: no SHA256SUMS found; pass --sums")
+
+
+def read_sums(path):
+    sums = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2:
+                sums[parts[1]] = parts[0].lower()
+    return sums
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download(url, dest):
+    with urllib.request.urlopen(url, timeout=60) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+
+
+def place(name, directory, sums, source):
+    filename = name + ".onnx"
+    want = sums.get(filename)
+    if want is None:
+        raise SystemExit("kilix-yolox-fetch: %s is not in the checksum list" % filename)
+    dest = os.path.join(directory, filename)
+    if os.path.exists(dest) and sha256_of(dest) == want:
+        print("%s: present, verified" % filename)
+        return
+    part = dest + ".part"
+    try:
+        if source:
+            if not os.path.isfile(source):
+                raise SystemExit("kilix-yolox-fetch: --from %s: no such file" % source)
+            shutil.copyfile(source, part)
+        else:
+            url = URL % (RELEASE, name)
+            print("%s: fetching %s" % (filename, url))
+            try:
+                download(url, part)
+            except OSError as problem:
+                raise SystemExit("kilix-yolox-fetch: %s: %s" % (url, problem))
+    except BaseException:
+        # Whatever stopped the copy, a half-written .part must not stay
+        # behind to be mistaken for a download in progress.
+        if os.path.exists(part):
+            os.unlink(part)
+        raise
+    got = sha256_of(part)
+    if got != want:
+        os.unlink(part)
+        raise SystemExit("kilix-yolox-fetch: %s: sha256 %s, expected %s; refused"
+                         % (filename, got, want))
+    os.replace(part, dest)
+    print("%s: %d bytes, verified" % (filename, os.path.getsize(dest)))
+
+
+def write_notices(directory, sums):
+    licence = os.path.join(directory, "LICENSE.yolox")
+    if not os.path.exists(licence):
+        try:
+            download(LICENSE_URL % RELEASE, licence)
+        except Exception as problem:                  # noqa: BLE001
+            print("kilix-yolox-fetch: licence text not fetched: %s" % problem,
+                  file=sys.stderr)
+    with open(os.path.join(directory, "NOTICE"), "w") as f:
+        f.write("YOLOX model weights\n")
+        f.write("Copyright (c) Megvii Inc. and its affiliates.\n")
+        f.write("Licensed under the Apache License, Version 2.0; see LICENSE.yolox.\n")
+        f.write("Obtained from Megvii-BaseDetection/YOLOX release %s.\n\n" % RELEASE)
+        for filename, digest in sorted(sums.items()):
+            f.write("%s  %s\n" % (digest, filename))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("names", nargs="*", default=list(NAMES))
+    parser.add_argument("--dir", default=default_dir())
+    parser.add_argument("--sums")
+    parser.add_argument("--from", dest="source",
+                        help="verify and copy this file instead of downloading")
+    options = parser.parse_args()
+    if options.source and len(options.names) != 1:
+        raise SystemExit("kilix-yolox-fetch: --from takes exactly one name")
+    for name in options.names:
+        if name not in NAMES:
+            raise SystemExit("kilix-yolox-fetch: unknown model %s (one of %s)"
+                             % (name, ", ".join(NAMES)))
+    sums = read_sums(find_sums(options.sums))
+    os.makedirs(options.dir, exist_ok=True)
+    for name in options.names:
+        place(name, options.dir, sums, options.source)
+    write_notices(options.dir, sums)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

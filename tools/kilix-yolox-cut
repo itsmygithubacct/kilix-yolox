@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Cut a YOLOX export at its nine raw head outputs, for another input size.
+
+The export's tail - Reshape, Concat, Transpose - carries shape constants
+for the size it was exported at, so the graph cannot simply be run at
+320x320.  Cut before the tail, at the regression, objectness and class
+convolutions of each level, it can; and each of the nine tensors then gets
+its own quantisation scale, which is what makes an INT8 compile of this
+model work at all.  See docs/npu-recipe.md.
+
+  kilix-yolox-cut MODEL.onnx --size 320 [--out PATH]
+
+Writes MODEL_320.onnx beside the input unless --out says otherwise, and
+prints the nine output names in level order so a compiler can be told
+them.  Needs the onnx package.
+"""
+import argparse
+import os
+import sys
+
+
+def raw_head_names(model):
+    g = model.graph
+    producer = {o: n for n in g.node for o in n.output}
+    names = []
+    for n in g.node:
+        if n.op_type == "Concat" and len(n.input) == 3:
+            reg, obj_s, cls_s = n.input
+            obj, cls = producer.get(obj_s), producer.get(cls_s)
+            # Both the objectness and the class inputs come through a
+            # Sigmoid in this head; a Concat with one and not the other
+            # is some other Concat, and cutting there would be silent.
+            if obj is None or cls is None or obj.op_type != "Sigmoid" or cls.op_type != "Sigmoid":
+                continue
+            names.append((reg, obj.input[0], cls.input[0]))
+    if len(names) != 3:
+        raise SystemExit("expected three head concats, found %d" % len(names))
+    return names
+
+
+def cut(src, size, out_path):
+    try:
+        import onnx
+    except ImportError:
+        raise SystemExit("kilix-yolox-cut: needs the onnx package (pip install onnx)")
+    if not os.path.isfile(src):
+        raise SystemExit("kilix-yolox-cut: %s: no such file" % src)
+    m = onnx.load(src)
+    names = raw_head_names(m)
+    producer = {o: n for n in m.graph.node for o in n.output}
+    seen = set()
+    todo = [x for level in names for x in level]
+    while todo:
+        node = producer.get(todo.pop())
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        todo.extend(node.input)
+    nodes = [n for n in m.graph.node if id(n) in seen]
+    del m.graph.node[:]
+    m.graph.node.extend(nodes)
+    del m.graph.output[:]
+    for level in names:
+        for x in level:
+            m.graph.output.append(onnx.helper.make_tensor_value_info(
+                x, onnx.TensorProto.FLOAT, ["N", "C", "H", "W"]))
+    del m.graph.value_info[:]
+    dims = m.graph.input[0].type.tensor_type.shape.dim
+    dims[2].dim_value, dims[3].dim_value = size, size
+    onnx.checker.check_model(m)
+    # Written beside the output and renamed over it, so a cut that dies
+    # halfway does not leave a truncated .onnx where a model was.
+    part = out_path + ".part"
+    try:
+        onnx.save(m, part)
+        os.replace(part, out_path)
+    finally:
+        if os.path.exists(part):
+            os.unlink(part)
+    return names
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("model")
+    parser.add_argument("--size", type=int, default=320)
+    parser.add_argument("--out")
+    options = parser.parse_args()
+    if options.size <= 0 or options.size % 32:
+        raise SystemExit("kilix-yolox-cut: size must be a positive multiple of 32")
+    out = options.out or "%s_%d.onnx" % (os.path.splitext(options.model)[0], options.size)
+    names = cut(options.model, options.size, out)
+    print(out)
+    for stride, (reg, obj, cls) in zip((8, 16, 32), names):
+        print("stride %2d: reg %s  obj %s  cls %s" % (stride, reg, obj, cls))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""The YOLOX detector, as the subprocess kilix-look talks to.
+
+The contract is kilix-object-detect's: read one BGRA frame from stdin,
+write float32[20][6] to stdout - rows of [class, score, y0, x0, y1, x1],
+coordinates normalised 0-1 in the frame that was sent, score-ordered - and
+loop.  Both sides are fixed size, so the framing is the sizes themselves.
+Class ids are COCO's, in the order every YOLO family uses, so the caller's
+allowlist does not know which detector answered.
+
+What differs from the Ultralytics subprocess is on this side of the pipe
+only: the frame is letterboxed top-left into the model's input with 114,
+fed raw 0-255 BGR, and the head's one-to-many output is decoded and
+suppressed here.  Two model shapes are accepted - the export with one
+(1, N, 85) output, and a graph cut at the nine raw head convolutions,
+which is the form a smaller input size or an NPU wants.
+
+  --geometry WxH     frame size, passed by the caller (320x320)
+  --model NAME|PATH  yolox_s, yolox_tiny, yolox_nano, or an .onnx path; a
+                     name prefers NAME_<size>.onnx when the frame is square
+                     and kilix-yolox-cut has made one; KILIX_YOLOX_MODEL
+                     overrides everything
+  --conf F           score floor, 0.25
+  --nms F            suppression overlap, 0.45
+  --per-class        suppress within a class only (YOLOX's demo behaviour)
+  --input-size N     the model's input when the graph leaves it open
+  --threads N        intra-op threads for the runtime, 0 = its default
+  --verbose          per-frame timing on stderr
+
+Answering with zeros beats dying: a model that fails to load leaves the
+caller with a working motion-only recorder, where a dead pipe would take
+the picture down with the detection.
+"""
+import argparse
+import os
+import struct
+import sys
+import time
+
+ROWS, COLUMNS = 20, 6
+REPLY_BYTES = ROWS * COLUMNS * 4
+STRIDES = (8, 16, 32)
+FILL = 114
+NAMES = ("yolox_s", "yolox_tiny", "yolox_nano")
+
+
+def runtime_models():
+    # The runtime directory follows the same overrides the installer honours,
+    # so a runtime built somewhere else finds its own weights.
+    runtime = os.environ.get("KILIX_YOLOX_DIR")
+    if not runtime:
+        data = os.environ.get("GPU_TERMINAL_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "gpu_terminal")
+        runtime = os.path.join(data, "runtimes", "yolox")
+    return os.path.join(runtime, "models")
+
+
+def resolve_model(name, width, height):
+    """A bare name prefers the cut that matches the frame.
+
+    kilix-look sends a 320-pixel square, and the export is 640: fed that
+    square, the model sees a 2x nearest-neighbour upscale and on the test
+    image scores the dog at 0.52 where the same weights cut to 320 score it
+    at 0.89.  So yolox_s resolves to yolox_s_320.onnx when kilix-yolox-cut
+    has made one and the frame is 320x320, and to the export otherwise.
+    """
+    override = os.environ.get("KILIX_YOLOX_MODEL")
+    if override:
+        return override
+    if name.endswith(".onnx") or os.sep in name:
+        return name
+    if width == height:
+        cut = os.path.join(runtime_models(), "%s_%d.onnx" % (name, width))
+        if os.path.exists(cut):
+            return cut
+    return os.path.join(runtime_models(), name + ".onnx")
+
+
+def read_exactly(stream, size):
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def empty_reply():
+    return struct.pack("<%df" % (ROWS * COLUMNS), *([0.0] * (ROWS * COLUMNS)))
+
+
+def parse_geometry(text):
+    """WxH, both positive.  Nothing else can be read from the pipe: a
+    zero-byte frame is always "already there", and the loop would answer
+    it forever without ever blocking on stdin."""
+    width, sep, height = text.partition("x")
+    try:
+        width, height = int(width), int(height)
+    except ValueError:
+        width = height = 0
+    if not sep or width <= 0 or height <= 0:
+        raise SystemExit("kilix-yolox-detect: --geometry wants WxH in pixels, not %r" % text)
+    return width, height
+
+
+class Detector:
+    """One session, one input geometry, one decode path chosen at load."""
+
+    def __init__(self, path, threads, input_size, conf, iou, per_class):
+        import numpy as np
+        import onnxruntime as ort
+
+        self.np = np
+        options = ort.SessionOptions()
+        if threads > 0:
+            options.intra_op_num_threads = threads
+        options.log_severity_level = 3
+        self.session = ort.InferenceSession(
+            path, options, providers=["CPUExecutionProvider"])
+        self.input = self.session.get_inputs()[0]
+        shape = self.input.shape
+        h = shape[2] if isinstance(shape[2], int) else input_size
+        w = shape[3] if isinstance(shape[3], int) else input_size
+        if h % 32 or w % 32:
+            raise ValueError("input %dx%d is not a multiple of 32" % (w, h))
+        self.size = (w, h)
+        outputs = self.session.get_outputs()
+        self.raw = len(outputs) == 9
+        if not self.raw and len(outputs) != 1:
+            raise ValueError("expected 1 or 9 outputs, model has %d" % len(outputs))
+        self.conf = conf
+        self.iou = iou
+        self.per_class = per_class
+        # The objectness gate on the logit, once: sigmoid is monotonic, so
+        # obj > logit(conf) is what sig(obj) > conf is.  Clamped the way
+        # the C library clamps, so conf 0 asks for everything rather than
+        # for log(0).
+        clamped = min(max(conf, 1e-6), 1.0 - 1e-6)
+        self.gate = np.log(clamped / (1.0 - clamped))
+        self.levels = [(s, h // s, w // s) for s in STRIDES]
+        self.cells = sum(lh * lw for _, lh, lw in self.levels)
+
+    def letterbox(self, bgra):
+        np = self.np
+        tw, th = self.size
+        ih, iw = bgra.shape[:2]
+        r = min(th / ih, tw / iw)
+        nh, nw = int(ih * r), int(iw * r)
+        canvas = np.full((th, tw, 3), FILL, dtype=np.uint8)
+        yi = (np.arange(nh) / r).astype(np.int32).clip(0, ih - 1)
+        xi = (np.arange(nw) / r).astype(np.int32).clip(0, iw - 1)
+        canvas[:nh, :nw] = bgra[yi][:, xi][:, :, :3]
+        return canvas.transpose(2, 0, 1)[None].astype(np.float32), r
+
+    def __call__(self, bgra):
+        np = self.np
+        chw, ratio = self.letterbox(bgra)
+        outputs = self.session.run(None, {self.input.name: chw})
+        if self.raw:
+            boxes, scores, cids = self.decode_raw(outputs)
+        else:
+            boxes, scores, cids = self.decode_flat(outputs[0][0])
+        keep = nms(np, boxes, scores, cids, self.iou, self.per_class)
+        h, w = bgra.shape[:2]
+        rows = []
+        for i in keep:
+            x0, y0, x1, y1 = (boxes[i] / ratio).tolist()
+            rows.append((int(cids[i]), float(scores[i]),
+                         min(max(y0 / h, 0.0), 1.0), min(max(x0 / w, 0.0), 1.0),
+                         min(max(y1 / h, 0.0), 1.0), min(max(x1 / w, 0.0), 1.0)))
+        return rows
+
+    def grid(self, block, keep, gx, gy, stride):
+        np = self.np
+        reg = block[keep, :4]
+        cx = (reg[:, 0] + gx[keep]) * stride
+        cy = (reg[:, 1] + gy[keep]) * stride
+        bw = np.exp(reg[:, 2]) * stride
+        bh = np.exp(reg[:, 3]) * stride
+        return np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], 1)
+
+    def decode_flat(self, cells):
+        """The export: sigmoids done, boxes still in grid units."""
+        np = self.np
+        boxes, scores, cids = [], [], []
+        offset = 0
+        for stride, h, w in self.levels:
+            n = h * w
+            block = cells[offset:offset + n]
+            offset += n
+            obj = block[:, 4]
+            gate = obj > self.conf
+            if not gate.any():
+                continue
+            cls = block[:, 5:]
+            score = obj * cls.max(1)
+            keep = gate & (score > self.conf)
+            if not keep.any():
+                continue
+            gy, gx = np.divmod(np.arange(n), w)
+            boxes.append(self.grid(block, keep, gx, gy, stride))
+            scores.append(score[keep])
+            cids.append(cls[keep].argmax(1))
+        return self.gather(boxes, scores, cids)
+
+    def decode_raw(self, outputs):
+        """Nine raw tensors: gate on the objectness logit, sigmoid only the
+        survivors.  Levels are matched by their grid size, not their order,
+        because a graph cut by hand may list them any way it likes."""
+        np = self.np
+        regs, objs, clss = {}, {}, {}
+        for o in outputs:
+            c, h, w = o.shape[1], o.shape[2], o.shape[3]
+            (regs if c == 4 else objs if c == 1 else clss)[(h, w)] = o[0]
+        boxes, scores, cids = [], [], []
+        for stride, h, w in self.levels:
+            key = (h, w)
+            if key not in regs or key not in objs or key not in clss:
+                continue
+            obj = objs[key][0]
+            ys, xs = np.nonzero(obj > self.gate)
+            if len(ys) == 0:
+                continue
+            cl = clss[key][:, ys, xs]
+            cid = cl.argmax(0)
+            score = sigmoid(np, obj[ys, xs]) * sigmoid(np, cl[cid, np.arange(len(ys))])
+            keep = score > self.conf
+            if not keep.any():
+                continue
+            reg = regs[key][:, ys, xs].T
+            block = np.concatenate([reg, np.zeros((len(ys), 1))], 1)
+            boxes.append(self.grid(block, keep, xs.astype(float), ys.astype(float), stride))
+            scores.append(score[keep])
+            cids.append(cid[keep])
+        return self.gather(boxes, scores, cids)
+
+    def gather(self, boxes, scores, cids):
+        """One list, minus anything that is not a number.  A size logit
+        past what exp() holds is a box with infinite edges: clamped, it
+        would be reported as the whole frame, and the caller converts
+        rows to int without asking.  Not a detection."""
+        np = self.np
+        if not boxes:
+            return np.zeros((0, 4)), np.zeros(0), np.zeros(0, dtype=int)
+        boxes = np.concatenate(boxes)
+        scores = np.concatenate(scores)
+        cids = np.concatenate(cids)
+        finite = np.isfinite(boxes).all(1) & np.isfinite(scores)
+        return boxes[finite], scores[finite], cids[finite]
+
+
+def sigmoid(np, x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+
+def nms(np, boxes, scores, cids, thr, per_class):
+    order = scores.argsort()[::-1]
+    x1, y1, x2, y2 = boxes.T
+    area = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    keep = []
+    while order.size:
+        i = order[0]
+        keep.append(i)
+        rest = order[1:]
+        xx1 = np.maximum(x1[i], x1[rest]); yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest]); yy2 = np.minimum(y2[i], y2[rest])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        iou = inter / (area[i] + area[rest] - inter + 1e-9)
+        drop = iou > thr
+        if per_class:
+            drop &= cids[rest] == cids[i]
+        order = rest[~drop]
+    return keep
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--geometry", default="320x320")
+    parser.add_argument("--model", default="yolox_s")
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--nms", type=float, default=0.45)
+    parser.add_argument("--per-class", action="store_true")
+    parser.add_argument("--input-size", type=int, default=320)
+    parser.add_argument("--threads", type=int, default=0)
+    parser.add_argument("--verbose", action="store_true")
+    options = parser.parse_args()
+
+    width, height = parse_geometry(options.geometry)
+    frame_bytes = width * height * 4
+    if not 0.0 <= options.conf < 1.0:
+        raise SystemExit("kilix-yolox-detect: --conf is a probability below 1")
+    if not 0.0 <= options.nms <= 1.0:
+        raise SystemExit("kilix-yolox-detect: --nms is an overlap between 0 and 1")
+
+    detector = None
+    path = resolve_model(options.model, width, height)
+    started = time.monotonic()
+    try:
+        detector = Detector(path, options.threads, options.input_size,
+                            options.conf, options.nms, options.per_class)
+        if options.verbose:
+            print("kilix-yolox-detect: %s %dx%d %s loaded in %.2f s" % (
+                os.path.basename(path), detector.size[0], detector.size[1],
+                "raw" if detector.raw else "flat", time.monotonic() - started),
+                file=sys.stderr, flush=True)
+    except Exception as problem:                      # noqa: BLE001
+        print("kilix-yolox-detect: %s: %s" % (path, problem),
+              file=sys.stderr, flush=True)
+        if not os.path.exists(path):
+            print("kilix-yolox-detect: no model; run kilix-yolox-fetch",
+                  file=sys.stderr, flush=True)
+
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    while True:
+        frame = read_exactly(stdin, frame_bytes)
+        if frame is None:
+            return 0
+        rows = [0.0] * (ROWS * COLUMNS)
+        if detector is not None:
+            try:
+                np = detector.np
+                t0 = time.monotonic()
+                image = np.frombuffer(frame, dtype=np.uint8).reshape((height, width, 4))
+                found = detector(image)[:ROWS]
+                for slot, row in enumerate(found):
+                    rows[slot * COLUMNS:(slot + 1) * COLUMNS] = row
+                if options.verbose:
+                    print("kilix-yolox-detect: %d boxes in %.1f ms" % (
+                        len(found), (time.monotonic() - t0) * 1e3),
+                        file=sys.stderr, flush=True)
+            except Exception as problem:              # noqa: BLE001
+                print("kilix-yolox-detect: %s" % problem, file=sys.stderr,
+                      flush=True)
+        stdout.write(struct.pack("<%df" % (ROWS * COLUMNS), *rows))
+        stdout.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
