@@ -65,6 +65,7 @@ $(BUILD_DIR)/test-%: tests/test_%.c $(BUILD_DIR)/kyx_fixture.o $(STATIC_LIB) | $
 		$(STATIC_LIB) $(LDLIBS) -o $@
 
 test: $(TESTS) $(COMMAND)
+	python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 	@set -e; for binary in $(TESTS); do \
 		printf '\n== %s ==\n' "$$binary"; \
 		"$$binary"; \

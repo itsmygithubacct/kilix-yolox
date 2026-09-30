@@ -12,14 +12,14 @@ one environment variable on the caller's side.
 make
 make test
 
-kilix-yolox-fetch                                   # Megvii's weights, verified
-kilix-yolox-cut ~/.local/gpu_terminal/runtimes/yolox/models/yolox_s.onnx --size 320
-export KILIX_OBJECT_DETECTOR="$HOME/.local/gpu_terminal/runtimes/yolox/bin/kilix-yolox-detect"
-kilix-look image photo.jpg
+kilix install yolox                 # runtime, explicit model agreement, 320 cut
+kilix yolox check
+kilix look image photo.jpg
 ```
 
-**Status: builds, tests pass, measured; not release-admitted.** No weights
-are part of this repository; a checksum list and a fetch step are.
+No weights are part of this repository. Kilix owns runtime installation and
+uses its pinned Content catalog and licence authority to acquire them.
+The measurements below are recorded measurements, not results of installation.
 
 ## Why a second detector
 
@@ -144,14 +144,26 @@ quantises.
 ## Getting a runtime
 
 ```sh
-uv venv ~/.local/gpu_terminal/runtimes/yolox/venv
-uv pip install --python ~/.local/gpu_terminal/runtimes/yolox/venv onnxruntime numpy onnx
+kilix models show yolox_s
+kilix models install yolox_s         # terminal confirmation and typed agreement
+kilix install yolox
+KILIX_YOLOX_MODEL=yolox_nano kilix install yolox
 ```
 
-then a wrapper in the runtime's `bin/` that runs `tools/kilix-yolox-detect`
-with that interpreter, as `kilix install yolo` writes for the Ultralytics
-detector. A `kilix install yolox` that does this is the next step and
-lives in Kilix, not here.
+Kilix creates the virtualenv, installs ONNX Runtime, numpy and onnx, verifies
+the existing Content agreement and manifest, cuts the model, and writes the
+wrapper and `KILIX_OBJECT_DETECTOR` setting consumed by look and NVR. Runtime
+installation never accepts a model licence on the user's behalf; `--yes`
+only skips the runtime confirmation. Reinstalling with another supported model
+refreshes the wrapper. A bare `KILIX_YOLOX_MODEL` name resolves inside
+`KILIX_YOLOX_DIR/models` and prefers the cut matching the frame geometry;
+an explicit `.onnx` path remains an explicit path.
+
+`kilix yolox check` checks the agreement and installed byte binding without
+setup. An older runtime without that binding needs `kilix install yolox` once.
+These checks do not perform inference or certify model accuracy. The standalone
+fetch tool is a low-level checksum utility; it does not create the Content
+agreement needed by the integrated installer.
 
 ## What it reuses
 
