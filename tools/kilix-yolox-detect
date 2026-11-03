@@ -27,9 +27,9 @@ which is the form a smaller input size or an NPU wants.
   --threads N        intra-op threads for the runtime, 0 = its default
   --verbose          per-frame timing on stderr
 
-Answering with zeros beats dying: a model that fails to load leaves the
-caller with a working motion-only recorder, where a dead pipe would take
-the picture down with the detection.
+Load/inference failures and incomplete frames exit unsuccessfully without
+an empty reply. Consumers can distinguish provider failure from a valid
+frame with no detections.
 """
 import argparse
 import os
@@ -82,6 +82,8 @@ def read_exactly(stream, size):
     while remaining > 0:
         chunk = stream.read(remaining)
         if not chunk:
+            if chunks:
+                raise EOFError("incomplete input frame")
             return None
         chunks.append(chunk)
         remaining -= len(chunk)
@@ -277,7 +279,7 @@ def nms(np, boxes, scores, cids, thr, per_class):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--geometry", default="320x320")
     parser.add_argument("--model", default="yolox_s")
     parser.add_argument("--conf", type=float, default=0.25)
@@ -312,11 +314,16 @@ def main():
         if not os.path.exists(path):
             print("kilix-yolox-detect: no model; run kilix-yolox-fetch",
                   file=sys.stderr, flush=True)
+        return 1
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
     while True:
-        frame = read_exactly(stdin, frame_bytes)
+        try:
+            frame = read_exactly(stdin, frame_bytes)
+        except (EOFError, OSError) as problem:
+            print("kilix-yolox-detect: %s" % problem, file=sys.stderr, flush=True)
+            return 1
         if frame is None:
             return 0
         rows = [0.0] * (ROWS * COLUMNS)
@@ -335,6 +342,7 @@ def main():
             except Exception as problem:              # noqa: BLE001
                 print("kilix-yolox-detect: %s" % problem, file=sys.stderr,
                       flush=True)
+                return 1
         stdout.write(struct.pack("<%df" % (ROWS * COLUMNS), *rows))
         stdout.flush()
 

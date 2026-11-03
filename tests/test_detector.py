@@ -58,16 +58,16 @@ class SubprocessContract(unittest.TestCase):
             status = detector.main()
         return status, output.buffer.getvalue(), errors.getvalue()
 
-    def test_missing_runtime_preserves_one_reply_per_complete_frame(self):
+    def test_missing_runtime_fails_without_an_empty_detection(self):
         def unavailable(*_):
             raise ImportError("private unavailable-runtime fixture")
 
         status, payload, errors = self.run_pipe(b"\0" * (16 * 2 + 3), unavailable)
-        self.assertEqual(status, 0)
-        self.assertEqual(payload, bytes(480 * 2))
+        self.assertNotEqual(status, 0)
+        self.assertEqual(payload, b"")
         self.assertIn("unavailable-runtime", errors)
 
-    def test_reply_failure_stays_framed_and_later_frames_continue(self):
+    def test_inference_failure_fails_without_an_empty_detection(self):
         class BrokenInference:
             class np:
                 uint8 = object()
@@ -77,10 +77,9 @@ class SubprocessContract(unittest.TestCase):
                     raise ValueError("private inference failure fixture")
 
         status, payload, errors = self.run_pipe(b"\0" * 32, lambda *_: BrokenInference())
-        self.assertEqual(status, 0)
-        self.assertEqual(len(payload), 960)
-        self.assertEqual(struct.unpack("<240f", payload), (0.0,) * 240)
-        self.assertEqual(errors.count("private inference failure fixture"), 2)
+        self.assertNotEqual(status, 0)
+        self.assertEqual(payload, b"")
+        self.assertEqual(errors.count("private inference failure fixture"), 1)
 
     def test_detection_rows_are_binary_normalized_contract_rows(self):
         row = (16, 0.75, 0.1, 0.2, 0.6, 0.8)
@@ -107,6 +106,12 @@ class SubprocessContract(unittest.TestCase):
             for actual, expected in zip(values[:6], row):
                 self.assertAlmostEqual(actual, expected, places=6)
             self.assertEqual(values[6:], (0.0,) * 114)
+
+    def test_incomplete_frame_is_not_normal_eof(self):
+        status, payload, errors = self.run_pipe(b'partial', lambda *_: object())
+        self.assertNotEqual(status, 0)
+        self.assertEqual(payload, b'')
+        self.assertIn('incomplete input frame', errors)
 
     def test_empty_input_produces_no_reply(self):
         status, payload, _ = self.run_pipe(b"", lambda *_: None)

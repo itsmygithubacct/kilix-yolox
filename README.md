@@ -182,3 +182,5 @@ want `onnx` as well. Nothing here links a runtime.
 MIT for the code in this repository. See `LICENSE`. YOLOX and its weights
 are Apache-2.0 and are not part of this repository; the fetch step places
 the Apache-2.0 licence and notice beside the weights it downloads.
+
+Provider failures exit unsuccessfully without an empty detection reply. A truncated BGRA frame is an error; EOF between complete frames is normal. The packaged wrapper checks its exact source and cut before launch and refuses model overrides. A moved YOLOX runtime must be reinstalled to bind its new path.
