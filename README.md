@@ -2,9 +2,17 @@
 
 The same detections, under a licence that lets you ship them.
 
+**Status:** not part of the Plebian-OS image. Kilix builds a pinned commit of
+this repository as its object-detector runtime when a user runs
+`kilix install yolox` (or `kilix yolox install`), in
+`~/.local/gpu_terminal/runtimes/yolox`, and points `KILIX_OBJECT_DETECTOR` at
+it for `kilix look` and `kilix nvr`. The YOLOX weights are Kilix Content
+assets (`yolox_nano`, `yolox_tiny`, `yolox_s`) that download only after the
+user's typed licence agreement; no weights ship in the ISO.
+
 A small C11 library holding the arithmetic on either side of a YOLOX
 model - letterbox in, boxes out - and **`kilix-yolox-detect`**, a
-subprocess that speaks [`kilix-look`](https://github.com/itsmygithubacct/kilix-object-detect)'s
+subprocess that speaks [`kilix-look`](https://github.com/itsmygithubacct/kilix-object-detect#readme)'s
 contract over ONNX Runtime, so switching the object detector to YOLOX is
 one environment variable on the caller's side.
 
@@ -21,94 +29,17 @@ No weights are part of this repository. Kilix owns runtime installation and
 uses its pinned Content catalog and licence authority to acquire them.
 The measurements below are recorded measurements, not results of installation.
 
-## Why a second detector
+## What it does
 
-`kilix-look` does not care which model answers it. It writes a square of
-BGRA to a subprocess and reads back a fixed 480-byte reply. The reference
-subprocess it ships runs Ultralytics YOLO, which is AGPL-3.0 including its
-weights. That is fine on a desk and a problem in anything redistributed.
-
-YOLOX (Megvii, Apache-2.0, weights included) is the permissively licensed
-detector of the same family. Measured on an INT8 NPU against the
-Ultralytics sizes, the `s` model was the most accurate of everything tried
-and the `nano` model the fastest and smallest, so the licence costs nothing
-at either end of the trade.
-
-| Model | Published input | Published mAP | ONNX size |
-| --- | --- | --- | --- |
-| `yolox_nano` | 416 | 25.8 | 3.7 MB |
-| `yolox_tiny` | 416 | 32.8 | 20 MB |
-| `yolox_s` | 640 | 40.5 | 36 MB |
-
-Figures from Megvii's release `0.1.1rc0`. `tiny` produced a confident false
-positive in measurement and is listed for completeness, not recommended.
-
-## What is measured
-
-A 320×320 BGRA frame through the subprocess, fifty times, on a six-core
-laptop CPU with ONNX Runtime's default threads; the first reply is the
-warm-up. The frame is the test image letterboxed into the square by the
-subprocess's own rule - top-left, fill 114, nearest neighbour - which is
-not the square kilix-look cuts (centred, black, area-averaged), so
-`kilix-look image` reports the same image a little differently: with
-`yolox_s_320`, bicycle 0.92, dog 0.88, car 0.80. The `_320` rows are the
-export cut by `kilix-yolox-cut` to run at kilix-look's own square; the
-others are the export at its native size, fed the same square upscaled.
-
-| Model | Warm-up | Mean | p95 | On the test image |
-| --- | --- | --- | --- | --- |
-| `yolox_nano_320` | 0.17 s | 8.1 ms | 8.7 ms | dog 0.86, bicycle 0.74, car 0.72 |
-| `yolox_tiny_320` | 0.21 s | 16.0 ms | 18.6 ms | bicycle 0.80, truck 0.66, dog 0.54 |
-| `yolox_s_320` | 0.25 s | 26.5 ms | 29.3 ms | dog 0.89, bicycle 0.88, car 0.59 |
-| `yolox_nano` (416) | 0.23 s | 11.2 ms | 13.6 ms | dog 0.85, bicycle 0.78, car 0.71 |
-| `yolox_tiny` (416) | 0.23 s | 24.2 ms | 31.0 ms | truck 0.87, bicycle 0.85, dog 0.63 |
-| `yolox_s` (640) | 0.35 s | 93.2 ms | 109.2 ms | truck 0.87, bicycle 0.78, dog 0.52 |
-
-Two things the table says. **Warm-up is a third of a second**, not the
-tens of seconds a framework import costs; kilix-look's 90-second
-allowance for a cold detector is never touched. And **feed the model the
-square it was cut for**: the 640 export handed a 320 square sees a 2x
-nearest-neighbour upscale and scores the dog at 0.52 where the same
-weights cut to 320 score it at 0.89. So a bare model name resolves to
-`NAME_320.onnx` when the frame is 320 square and the cut exists. Running
-`kilix-look --size 640` against the export is the other way round the
-same fact, and the most accurate: bicycle 0.97, dog 0.92, truck 0.68.
-
-**Decode and suppression in C cost 9 µs** per frame on the same machine
-against 320 µs in numpy, on the same tensors. That is the number a small
-NPU port needs, where decode on one slow core was a third of the frame
-budget.
-
-## The library
-
-```c
-ratio = kyx_letterbox(bgra, w, h, KYX_PIXFMT_BGRA, planar, 320, 320);
-/* ... the model ... */
-n = kyx_decode_raw(raw, 320, 320, 0.25f, boxes, capacity, &dropped);
-n = kyx_nms(boxes, n, 0.45f, false);
-kyx_unletterbox(boxes, n, ratio, w, h);
-kyx_reply(boxes, n, w, h, reply);        /* 480 bytes, kilix-look's rows */
-```
-
-YOLOX's conventions are not Ultralytics', and each produces plausible
-garbage rather than an error when carried over from the other family:
-raw 0-255 **BGR**, letterbox fill 114 with the image at the **top-left**,
-boxes as centre and size in stride units with an exponent on the size, and
-a one-to-many head that needs NMS. Each is one function with one test.
-
-Two head forms decode to the same boxes. `kyx_decode_flat()` takes the
-export's `(N, 85)` tensor. `kyx_decode_raw()` takes the nine raw
-convolution outputs - regression, objectness and class per stride - which
-is where a graph must be cut to quantise well or to run at a size other
-than the export's. The raw path gates on the objectness logit, one compare
-per cell, and reads the eighty class values only for the survivors; a test
-proves the gate rejects exactly what the full computation would.
-
-Suppression is class-agnostic by default. YOLOX's own demo suppresses
-within a class, and that leaves a `car` on top of every `truck` it is
-unsure of: one object, one box, is what a caller drawing them wants.
-
-No allocation on the per-frame path, no runtime linked, `-lm` only.
+- `libkilix-yolox`: letterbox, decode (flat or nine raw head outputs),
+  class-agnostic NMS and the 480-byte kilix-look reply, in C11 with no
+  allocation per frame and no runtime linked.
+- `kilix-yolox-detect`: an ONNX Runtime subprocess that answers kilix-look's
+  frame protocol, so the detector is swapped by one environment variable.
+- `kilix-yolox-cut`: re-exports a model cut at the nine raw outputs for a
+  320x320 square (the cut that also quantises for small NPUs).
+- `kilix-yolox-fetch`: downloads a YOLOX release export and refuses any file
+  not listed in `models/SHA256SUMS`.
 
 ## Commands
 
@@ -165,7 +96,29 @@ These checks do not perform inference or certify model accuracy. The standalone
 fetch tool is a low-level checksum utility; it does not create the Content
 agreement needed by the integrated installer.
 
-## What it reuses
+## How it works
+
+```
+kilix-look / kilix-nvr
+   |  square BGRA frame on stdin          (KILIX_OBJECT_DETECTOR)
+   v
+kilix-yolox-detect   ONNX Runtime session on yolox_*_320.onnx
+   |  raw head outputs
+   v
+libkilix-yolox       decode -> NMS -> unletterbox -> 480-byte reply
+   |
+   v
+kilix-look draws and reports the boxes
+```
+
+The detector reads fixed-size frames and writes fixed-size replies, so the
+caller never links a model runtime. YOLOX's own conventions (raw BGR, fill 114
+at the top-left, centre-and-size boxes in stride units, a head that needs NMS)
+are each handled by one tested C function; see [docs/library.md](docs/library.md).
+Feeding the model the square it was cut for matters more than model size; the
+numbers are in [docs/measurements.md](docs/measurements.md).
+
+### What it reuses
 
 Crops, motion gating, the pipe reader, the bundled-tool lookup and the
 drawing all stay in `kilix-object-detect`. This module adds a model, not a
@@ -176,6 +129,40 @@ second copy of the pipeline.
 C11 and POSIX for the library and command. The subprocess wants Python 3
 with `onnxruntime` and `numpy`; `kilix-yolox-cut` and the fixture generator
 want `onnx` as well. Nothing here links a runtime.
+
+## Documentation
+
+- [docs/library.md](docs/library.md): the C API and YOLOX's conventions.
+- [docs/measurements.md](docs/measurements.md): why a second detector, and the
+  recorded timings and detections per model.
+- [docs/npu-recipe.md](docs/npu-recipe.md): compiling the exports for a small
+  INT8 NPU.
+- [models/PROVENANCE.md](models/PROVENANCE.md): where the weights come from and
+  their checksums.
+
+## Related repositories
+
+- [kilix-object-detect](https://github.com/itsmygithubacct/kilix-object-detect#readme):
+  `kilix-look`, the pipeline whose detector slot this fills.
+- [kilix-nvr](https://github.com/itsmygithubacct/kilix-nvr#readme): the camera
+  recorder that runs the same detector.
+- [kilix-motion-detect](https://github.com/itsmygithubacct/kilix-motion-detect#readme):
+  the motion gate in front of detection.
+- [kilix](https://github.com/itsmygithubacct/kilix#readme): `kilix install
+  yolox` and `kilix yolox`.
+- [kilix-content](https://github.com/itsmygithubacct/kilix-content#readme): the
+  catalog records and licence agreement for the YOLOX weights.
+
+## Part of Plebian-OS
+
+kilix-yolox is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+Kilix builds a pinned commit of it on demand, as the detector runtime behind
+`kilix look` and `kilix nvr`. The map of every repository and how it ships is
+on the [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
 
