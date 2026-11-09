@@ -102,19 +102,19 @@ agreement needed by the integrated installer.
 kilix-look / kilix-nvr
    |  square BGRA frame on stdin          (KILIX_OBJECT_DETECTOR)
    v
-kilix-yolox-detect   ONNX Runtime session on yolox_*_320.onnx
-   |  raw head outputs
-   v
-libkilix-yolox       decode -> NMS -> unletterbox -> 480-byte reply
-   |
+kilix-yolox-detect   letterbox -> ONNX Runtime on yolox_*_320.onnx
+   |                 -> decode -> NMS -> 480-byte reply   (numpy)
    v
 kilix-look draws and reports the boxes
 ```
 
 The detector reads fixed-size frames and writes fixed-size replies, so the
-caller never links a model runtime. YOLOX's own conventions (raw BGR, fill 114
-at the top-left, centre-and-size boxes in stride units, a head that needs NMS)
-are each handled by one tested C function; see [docs/library.md](docs/library.md).
+caller never links a model runtime. The subprocess does its letterbox, decode
+and suppression in numpy. `libkilix-yolox` is the same arithmetic in C11 for a
+detector that cannot run Python, such as a compiled graph on a small NPU:
+YOLOX's own conventions (raw BGR, fill 114 at the top-left, centre-and-size
+boxes in stride units, a head that needs NMS) are each one tested C function;
+see [docs/library.md](docs/library.md).
 Feeding the model the square it was cut for matters more than model size; the
 numbers are in [docs/measurements.md](docs/measurements.md).
 
