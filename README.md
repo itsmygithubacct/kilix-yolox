@@ -8,7 +8,9 @@ this repository as its object-detector runtime when a user runs
 `~/.local/gpu_terminal/runtimes/yolox`, and points `KILIX_OBJECT_DETECTOR` at
 it for `kilix look` and `kilix nvr`. The YOLOX weights are Kilix Content
 assets (`yolox_nano`, `yolox_tiny`, `yolox_s`) that download only after the
-user's typed licence agreement; no weights ship in the ISO.
+user's typed licence agreement. The exception is the Plebian-OS 0.2.3 ISO: its
+offline default model bundle carries `yolox_nano` and `yolox_s`, and first
+boot installs them into the Kilix Content store.
 
 A small C11 library holding the arithmetic on either side of a YOLOX
 model - letterbox in, boxes out - and **`kilix-yolox-detect`**, a
